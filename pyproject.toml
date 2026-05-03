@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recaptcha_ia_solver"
+version = "0.1.0"
+description = "Image-grid reCAPTCHA solver — fine-tuned YOLO classifier with OIV7 detector fallback. No LLMs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "cateyelow"}]
+keywords = ["recaptcha", "yolo", "selenium", "captcha", "computer-vision"]
+dependencies = [
+  "numpy>=1.23",
+  "opencv-python>=4",
+  "Pillow>=9",
+  "requests>=2",
+  "ultralytics>=8",
+  "selenium>=4",
+]
+
+[project.optional-dependencies]
+runtime = [
+  # Browser automation stack used by the example harness. The library itself
+  # only needs a `selenium.webdriver` instance — bring your own driver.
+  "undetected-chromedriver>=3.5",
+]
+onnx = [
+  "onnx>=1.15",
+  "onnxruntime>=1.17",
+]
+test = [
+  "pytest>=7",
+]
+train = [
+  # `train_classifier.py` builds an 80/20 split and fine-tunes yolov8s-cls.
+  "ultralytics>=8",
+]
+
+[project.urls]
+Repository = "https://github.com/cateyelow/recaptcha_ia_solver"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["recaptcha_ia_solver*"]
+
+[tool.setuptools.package-data]
+recaptcha_ia_solver = ["*.py"]

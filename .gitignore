@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+.DS_Store
+
+# Per-attempt scratch space for downloaded captcha images
+/recaptcha_images/
+
+# Stray base-model auto-downloads (yolov8x-oiv7.pt etc) outside models/
+/yolov8*.pt
+/yolo26n.pt
+
+# Local debugging artifacts from the harness
+/realtest_dbg/
+/tmp_*/
+
+# Editor/agent local state
+.claude/
+.idea/
+.vscode/
