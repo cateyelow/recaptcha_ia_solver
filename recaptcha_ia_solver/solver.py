@@ -238,7 +238,7 @@ def classify_grid_cells(target_set: Iterable[int], grid_n: int, verbose, model) 
     return answers
 
 
-def get_target_classes(driver, model: YOLO) -> Set[int]:
+def get_target_classes(driver, model: YOLO, verbose: bool = False) -> Set[int]:
     """
     Inspect the reCAPTCHA challenge title and return the set of class IDs the
     detector should look for. An empty set signals "no supported category in
@@ -249,7 +249,11 @@ def get_target_classes(driver, model: YOLO) -> Set[int]:
             (By.XPATH, '//div[@id="rc-imageselect"]//strong')
         )
     )
-    return _resolve_target_classes(target.text or "", model)
+    target_text = target.text or ""
+    resolved = _resolve_target_classes(target_text, model)
+    if verbose:
+        print(f"challenge target={target_text!r} -> class ids {sorted(resolved)}")
+    return resolved
 
 
 def dynamic_and_selection_solver(target_set: Iterable[int], verbose, model):
@@ -561,7 +565,7 @@ def solve_recaptcha(driver, verbose):
                     EC.presence_of_element_located((By.ID, "rc-imageselect"))
                 )
 
-                target_set = get_target_classes(driver, primary)
+                target_set = get_target_classes(driver, primary, verbose)
                 model = primary
                 if not target_set and fallback_path:
                     if fallback is None:
@@ -569,7 +573,7 @@ def solve_recaptcha(driver, verbose):
                             print(f"loading fallback {fallback_path}")
                         fallback = _try_load_yolo(fallback_path, verbose=verbose)
                     if fallback is not None:
-                        target_set = get_target_classes(driver, fallback)
+                        target_set = get_target_classes(driver, fallback, verbose)
                         if target_set:
                             model = fallback
                 is_classifier = getattr(model, "task", None) == "classify"
@@ -602,7 +606,7 @@ def solve_recaptcha(driver, verbose):
                         answers = classify_grid_cells(target_set, 3, verbose, model)
                     else:
                         answers = dynamic_and_selection_solver(target_set, verbose, model)
-                    if len(answers) > 2:
+                    if len(answers) >= 1:
                         captcha = "dynamic"
                         break
                     else:
@@ -616,7 +620,7 @@ def solve_recaptcha(driver, verbose):
                         answers = classify_grid_cells(target_set, 3, verbose, model)
                     else:
                         answers = dynamic_and_selection_solver(target_set, verbose, model)
-                    if len(answers) > 2:
+                    if len(answers) >= 1:
                         captcha = "selection"
                         break
                     else:
