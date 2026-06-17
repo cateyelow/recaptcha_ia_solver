@@ -159,6 +159,30 @@ def test_classify_grid_cells_returns_one_indexed_matches(tmp_path, monkeypatch):
     assert sorted(answers) == [1, 5, 9]
 
 
+def test_write_dynamic_grid_image_composes_individual_tiles(tmp_path, monkeypatch):
+    """Dynamic 3x3 challenges can expose nine independent 100px tile images.
+    The solver must build a 300x300 composite before running grid detection."""
+    import os
+    from PIL import Image
+
+    from recaptcha_ia_solver import solver as M
+
+    monkeypatch.chdir(tmp_path)
+    os.makedirs("recaptcha_images", exist_ok=True)
+    tiles = []
+    for idx in range(9):
+        image = Image.new("RGB", (10, 10), (idx, idx + 10, idx + 20))
+        tiles.append(image)
+
+    M._write_dynamic_grid_image(tiles, grid_n=3, out_path="recaptcha_images/0.png")
+
+    composed = Image.open("recaptcha_images/0.png").convert("RGB")
+    assert composed.size == (30, 30)
+    assert composed.getpixel((5, 5)) == (0, 10, 20)
+    assert composed.getpixel((15, 5)) == (1, 11, 21)
+    assert composed.getpixel((25, 25)) == (8, 18, 28)
+
+
 def test_classify_grid_cells_4x4(tmp_path, monkeypatch):
     """4x4 squares-mode also works through the same code path."""
     import os

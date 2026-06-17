@@ -2,6 +2,7 @@
 import os
 import re
 import shutil
+from io import BytesIO
 from time import monotonic, sleep
 from typing import Iterable, Optional, Set
 
@@ -374,6 +375,45 @@ def download_img(name, url):
     del response
 
 
+def _write_dynamic_grid_image(images, grid_n=3, out_path="recaptcha_images/0.png"):
+    """Write a single composite grid from individual dynamic reCAPTCHA tiles."""
+    expected = grid_n * grid_n
+    if len(images) < expected:
+        raise ValueError(f"expected at least {expected} tiles, got {len(images)}")
+    tiles = [image.convert("RGB") for image in images[:expected]]
+    tile_w, tile_h = tiles[0].size
+    canvas = Image.new("RGB", (tile_w * grid_n, tile_h * grid_n))
+    for idx, tile in enumerate(tiles):
+        if tile.size != (tile_w, tile_h):
+            tile = tile.resize((tile_w, tile_h))
+        row, col = divmod(idx, grid_n)
+        canvas.paste(tile, (col * tile_w, row * tile_h))
+    canvas.save(out_path)
+
+
+def download_dynamic_grid_img(img_urls, grid_n=3):
+    """Download the current 3x3 challenge as recaptcha_images/0.png.
+
+    Static 3x3 challenges expose one composite URL repeated nine times.
+    Dynamic challenges expose separate tile URLs; compose them before model
+    inference so the grid math maps boxes/classes to the real cell positions.
+    """
+    expected = grid_n * grid_n
+    if len(img_urls) < expected:
+        download_img(0, img_urls[0])
+        return
+    if len(set(img_urls[:expected])) <= 1:
+        download_img(0, img_urls[0])
+        return
+
+    images = []
+    for url in img_urls[:expected]:
+        response = requests.get(url)
+        response.raise_for_status()
+        images.append(Image.open(BytesIO(response.content)).convert("RGB"))
+    _write_dynamic_grid_image(images, grid_n=grid_n)
+
+
 def _wait_for_new_dynamic_imgs(answers, before_img_urls, driver, max_wait_s=15):
     """
     Poll the dynamic-captcha grid until the answered cells show new image URLs,
@@ -621,7 +661,7 @@ def solve_recaptcha(driver, verbose):
                             f"squares: img count={len(img_urls)} "
                             f"distinct={len(set(img_urls))}"
                         )
-                    download_img(0, img_urls[0])
+                    download_dynamic_grid_img(img_urls, grid_n=3)
                     answers = []
                     if is_classifier and fallback_path:
                         if fallback is None:
