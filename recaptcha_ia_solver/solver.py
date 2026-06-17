@@ -38,6 +38,32 @@ DEFAULT_YOLO_FALLBACK_MODEL = "models/yolov8x-oiv7.pt"
 # reload until a fine-tuned model is plugged in. Ordered longest-first so
 # `re.search` honors compound terms before their substrings.
 RECAPTCHA_TO_OIV7 = {
+    # ── Korean challenge terms (Google renders the reCAPTCHA in the account's
+    # locale; Korean accounts get 자동차/버스/etc.). Values include both the
+    # primary classifier's lowercase class names and the OIV7 capitalized ones
+    # so whichever model is loaded resolves. Ordered longest-first like the
+    # English entries below so compound terms win before substrings. ──
+    "오토바이": ["motorcycle", "Motorcycle"],
+    "횡단보도": ["crosswalk", "Crosswalk"],
+    "소화전": ["hydrant", "Fire hydrant"],
+    "신호등": ["traffic light", "Traffic light"],
+    "자전거": ["bicycle", "Bicycle"],
+    "자동차": ["car", "Car"],
+    "트랙터": ["tractor", "Tractor"],
+    "야자수": ["palm", "Palm tree"],
+    "소방전": ["hydrant", "Fire hydrant"],
+    "택시": ["Taxi"],
+    "트럭": ["Truck"],
+    "버스": ["bus", "Bus"],
+    "굴뚝": ["chimney", "Chimney"],
+    "보트": ["Boat"],
+    "계단": ["stair", "Stairs", "stairs"],
+    "다리": ["bridge", "Bridge"],
+    "교각": ["bridge", "Bridge"],
+    "타워": ["Tower"],
+    "기차": ["Train"],
+    "열차": ["Train"],
+    "산": ["mountain", "Mountain"],
     "fire hydrant": ["Fire hydrant", "hydrant"],
     "parking meter": ["Parking meter"],
     "traffic light": ["Traffic light", "traffic light"],
@@ -84,7 +110,8 @@ def _resolve_model_path(path: str) -> str:
     """
     if not path or os.path.isabs(path) or os.path.exists(path):
         return path
-    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    # repo root = two levels up from this file (pkg/solver.py -> pkg -> repo)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     alt = os.path.join(project_root, path)
     return alt if os.path.exists(alt) else path
 
@@ -224,17 +251,25 @@ def classify_grid_cells(target_set: Iterable[int], grid_n: int, verbose, model) 
 
     results = model.predict(cells, task="classify", verbose=verbose)
     answers = []
+    cell_report = []
     for idx, res in enumerate(results):
         probs = getattr(res, "probs", None)
         if probs is None:
+            cell_report.append(f"{idx + 1}:none")
             continue
         top1 = int(getattr(probs, "top1", -1))
+        top1_conf = float(getattr(probs, "top1conf", 1.0) or 1.0)
+        cell_report.append(f"{idx + 1}:cls{top1}@{top1_conf:.2f}")
         if top1 not in target_set:
             continue
-        top1_conf = float(getattr(probs, "top1conf", 1.0) or 1.0)
         if top1_conf < min_conf:
             continue
         answers.append(idx + 1)
+    if verbose:
+        print(
+            f"classify_grid_cells: target_set={sorted(target_set)} "
+            f"min_conf={min_conf} cells=[{' '.join(cell_report)}] -> answers={answers}"
+        )
     return answers
 
 
@@ -256,38 +291,57 @@ def get_target_classes(driver, model: YOLO, verbose: bool = False) -> Set[int]:
     return resolved
 
 
+def _detect_conf() -> float:
+    """Confidence floor for the detection models. reCAPTCHA serves small,
+    heavily-compressed tiles, so a stock detector's boxes on a real target
+    often land at 0.15-0.30 — well under the ultralytics 0.25 default, which
+    silently dropped them. Tunable via RECAPTCHA_YOLO_DETECT_CONF."""
+    try:
+        return float(os.environ.get("RECAPTCHA_YOLO_DETECT_CONF", "0.15"))
+    except ValueError:
+        return 0.15
+
+
 def dynamic_and_selection_solver(target_set: Iterable[int], verbose, model):
     """
-    Get the answers from the recaptcha images.
+    Detection-model path for a 3x3 grid: run the detector on the whole grid
+    image and return the 1-indexed cells whose center a target-class box falls
+    in. The 3x3 "select all images" tiles are independent photos, so a box
+    maps to exactly one cell (its center) — overlap-mapping would leak false
+    positives across tile seams. Cell size is derived from the actual image
+    dimensions rather than a hard-coded 100px so non-300x300 grids still work.
     :param target_set: iterable of YOLO class IDs that satisfy the challenge.
     :param verbose: print verbose.
     """
     target_set = set(int(x) for x in target_set)
 
-    image = Image.open("recaptcha_images/0.png")
-    image = np.asarray(image)
-    result = model.predict(image, task="detect", verbose=verbose)
+    image = np.asarray(Image.open("recaptcha_images/0.png").convert("RGB"))
+    height, width = image.shape[:2]
+    cell_h, cell_w = height / 3.0, width / 3.0
+    result = model.predict(
+        image, task="detect", verbose=verbose, conf=_detect_conf()
+    )
 
-    target_index = [
-        idx for idx, num in enumerate(result[0].boxes.cls) if int(num) in target_set
-    ]
-
-    answers = []
-    boxes = result[0].boxes.data
-    for i in target_index:
-        target_box = boxes[i]
-        x1, y1 = int(target_box[0]), int(target_box[1])
-        x2, y2 = int(target_box[2]), int(target_box[3])
-
-        xc = (x1 + x2) / 2
-        yc = (y1 + y2) / 2
-
-        row = yc // 100
-        col = xc // 100
-        answer = int(row * 3 + col + 1)
-        answers.append(answer)
-
-    return list(set(answers))
+    answers = set()
+    hits = []
+    for box in result[0].boxes:
+        cls_id = int(box.cls)
+        if cls_id not in target_set:
+            continue
+        x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
+        xc, yc = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        row = min(2, max(0, int(yc // cell_h)))
+        col = min(2, max(0, int(xc // cell_w)))
+        answer = row * 3 + col + 1
+        answers.add(answer)
+        hits.append(f"cls{cls_id}@{float(box.conf):.2f}->cell{answer}")
+    if verbose:
+        print(
+            f"dynamic_and_selection_solver: grid={width}x{height} "
+            f"target_set={sorted(target_set)} hits=[{' '.join(hits)}] "
+            f"-> answers={sorted(answers)}"
+        )
+    return sorted(answers)
 
 
 def get_all_captcha_img_urls(driver):
@@ -405,100 +459,50 @@ def paste_new_img_on_main_img(main, new, loc):
     cv2.imwrite("recaptcha_images/0.png", paste)
 
 
-def get_occupied_cells(vertices):
-    """
-    Get the occupied cells from the vertices.
-    :param vertices: vertices of the image.
-    """
-    occupied_cells = set()
-    rows, cols = zip(*[((v - 1) // 4, (v - 1) % 4) for v in vertices])
-
-    for i in range(min(rows), max(rows) + 1):
-        for j in range(min(cols), max(cols) + 1):
-            occupied_cells.add(4 * i + j + 1)
-
-    return sorted(list(occupied_cells))
-
-
 def square_solver(target_set: Iterable[int], verbose, model):
     """
-    Get the answers from the recaptcha images.
+    Detection-model path for a 4x4 "select all squares" grid: run the detector
+    on the whole composite and return every 1-indexed cell a target-class box
+    overlaps. Unlike the 3x3 grid, the 4x4 is one photo cut into 16 squares, so
+    an object box legitimately spans several cells and all of them must be
+    selected. Cell size is derived from the actual image dimensions.
     :param target_set: iterable of YOLO class IDs that satisfy the challenge.
     :param verbose: print verbose.
     """
     target_set = set(int(x) for x in target_set)
 
-    image = Image.open("recaptcha_images/0.png")
-    image = np.asarray(image)
-    result = model.predict(image, task="detect", verbose=verbose)
-    boxes = result[0].boxes.data
+    image = np.asarray(Image.open("recaptcha_images/0.png").convert("RGB"))
+    height, width = image.shape[:2]
+    cell_h, cell_w = height / 4.0, width / 4.0
+    result = model.predict(
+        image, task="detect", verbose=verbose, conf=_detect_conf()
+    )
 
-    target_index = [
-        idx for idx, num in enumerate(result[0].boxes.cls) if int(num) in target_set
-    ]
-
-    answers = []
-    count = 0
-    for i in target_index:
-        target_box = boxes[i]
-        p1, p2 = (int(target_box[0]), int(target_box[1])), (
-            int(target_box[2]),
-            int(target_box[3]),
+    answers = set()
+    hits = []
+    for box in result[0].boxes:
+        cls_id = int(box.cls)
+        if cls_id not in target_set:
+            continue
+        x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
+        r1 = min(3, max(0, int(y1 // cell_h)))
+        r2 = min(3, max(0, int((y2 - 1) // cell_h)))
+        c1 = min(3, max(0, int(x1 // cell_w)))
+        c2 = min(3, max(0, int((x2 - 1) // cell_w)))
+        cells = []
+        for r in range(r1, r2 + 1):
+            for c in range(c1, c2 + 1):
+                cell = r * 4 + c + 1
+                answers.add(cell)
+                cells.append(cell)
+        hits.append(f"cls{cls_id}@{float(box.conf):.2f}->{cells}")
+    if verbose:
+        print(
+            f"square_solver: grid={width}x{height} "
+            f"target_set={sorted(target_set)} hits=[{' '.join(hits)}] "
+            f"-> answers={sorted(answers)}"
         )
-        x1, y1 = p1
-        x4, y4 = p2
-        x2 = x4
-        y2 = y1
-        x3 = x1
-        y3 = y4
-        xys = [x1, y1, x2, y2, x3, y3, x4, y4]
-
-        four_cells = []
-        for i in range(4):
-            x = xys[i * 2]
-            y = xys[(i * 2) + 1]
-
-            if x < 112.5 and y < 112.5:
-                four_cells.append(1)
-            if 112.5 < x < 225 and y < 112.5:
-                four_cells.append(2)
-            if 225 < x < 337.5 and y < 112.5:
-                four_cells.append(3)
-            if 337.5 < x <= 450 and y < 112.5:
-                four_cells.append(4)
-
-            if x < 112.5 and 112.5 < y < 225:
-                four_cells.append(5)
-            if 112.5 < x < 225 and 112.5 < y < 225:
-                four_cells.append(6)
-            if 225 < x < 337.5 and 112.5 < y < 225:
-                four_cells.append(7)
-            if 337.5 < x <= 450 and 112.5 < y < 225:
-                four_cells.append(8)
-
-            if x < 112.5 and 225 < y < 337.5:
-                four_cells.append(9)
-            if 112.5 < x < 225 and 225 < y < 337.5:
-                four_cells.append(10)
-            if 225 < x < 337.5 and 225 < y < 337.5:
-                four_cells.append(11)
-            if 337.5 < x <= 450 and 225 < y < 337.5:
-                four_cells.append(12)
-
-            if x < 112.5 and 337.5 < y <= 450:
-                four_cells.append(13)
-            if 112.5 < x < 225 and 337.5 < y <= 450:
-                four_cells.append(14)
-            if 225 < x < 337.5 and 337.5 < y <= 450:
-                four_cells.append(15)
-            if 337.5 < x <= 450 and 337.5 < y <= 450:
-                four_cells.append(16)
-        answer = get_occupied_cells(four_cells)
-        count += 1
-        for ans in answer:
-            answers.append(ans)
-    answers = sorted(list(answers))
-    return list(set(answers))
+    return sorted(answers)
 
 
 def solve_recaptcha(driver, verbose):
@@ -549,7 +553,11 @@ def solve_recaptcha(driver, verbose):
     # cannot solve this challenge tree (e.g., reCAPTCHA keeps failing our
     # verifies and re-issuing new challenges). Give up so the caller can
     # decide whether to retry from scratch instead of hanging forever.
-    overall_deadline = monotonic() + 120
+    try:
+        deadline_seconds = float(os.environ.get("RECAPTCHA_SOLVER_DEADLINE_SEC", "120"))
+    except ValueError:
+        deadline_seconds = 120.0
+    overall_deadline = monotonic() + deadline_seconds
 
     while True:
         if monotonic() > overall_deadline:
@@ -564,6 +572,27 @@ def solve_recaptcha(driver, verbose):
                 title_wrapper = WebDriverWait(driver, 10).until(
                     EC.presence_of_element_located((By.ID, "rc-imageselect"))
                 )
+                # Grid size + challenge type, detected structurally. The
+                # upstream string checks ("squares"/"none" in title) only work
+                # for an English-locale widget; IG serves reCAPTCHA in Korean
+                # (hl=ko) so they never matched — every challenge fell through
+                # to the 3x3-one-time branch, and 4x4 grids got sliced 3x3 into
+                # garbage cells. The <td> count is locale-proof: 16 tds = 4x4
+                # "select all squares", 9 = 3x3 "select all images".
+                try:
+                    td_count = len(
+                        driver.find_elements(
+                            By.XPATH, '//div[@id="rc-imageselect-target"]//td'
+                        )
+                    )
+                except Exception:
+                    td_count = -1
+                grid_n = 4 if td_count >= 16 else 3
+                if verbose:
+                    print(
+                        f"challenge wrapper: td_count={td_count} "
+                        f"grid={grid_n}x{grid_n} text={title_wrapper.text!r}"
+                    )
 
                 target_set = get_target_classes(driver, primary, verbose)
                 model = primary
@@ -583,47 +612,107 @@ def solve_recaptcha(driver, verbose):
                     if verbose:
                         print("skipping (no supported category in challenge)")
                     reload.click()
-                elif "squares" in title_wrapper.text:
+                elif grid_n == 4:
                     if verbose:
-                        print("Square captcha found....")
+                        print("found a 4x4 select-all-squares captcha")
                     img_urls = get_all_captcha_img_urls(driver)
+                    if verbose:
+                        print(
+                            f"squares: img count={len(img_urls)} "
+                            f"distinct={len(set(img_urls))}"
+                        )
                     download_img(0, img_urls[0])
-                    if is_classifier:
-                        answers = classify_grid_cells(target_set, 4, verbose, model)
-                    else:
-                        answers = square_solver(target_set, verbose, model)
+                    answers = []
+                    if is_classifier and fallback_path:
+                        if fallback is None:
+                            if verbose:
+                                print(f"loading fallback {fallback_path} for 4x4 detector")
+                            fallback = _try_load_yolo(fallback_path, verbose=verbose)
+                        if fallback is not None:
+                            fallback_target_set = get_target_classes(
+                                driver, fallback, verbose
+                            )
+                            if fallback_target_set:
+                                if verbose:
+                                    print("using fallback detector for 4x4 squares")
+                                answers = square_solver(
+                                    fallback_target_set, verbose, fallback
+                                )
+                                if verbose and not (len(answers) >= 1 and len(answers) < 16):
+                                    print(
+                                        "fallback detector produced no usable 4x4 answers; "
+                                        "falling back to classifier"
+                                    )
+                    if not (len(answers) >= 1 and len(answers) < 16):
+                        if is_classifier:
+                            answers = classify_grid_cells(target_set, 4, verbose, model)
+                        else:
+                            answers = square_solver(target_set, verbose, model)
                     if len(answers) >= 1 and len(answers) < 16:
                         captcha = "squares"
                         break
                     else:
+                        if verbose:
+                            print("squares: no usable answers, reloading")
                         reload.click()
-                elif "none" in title_wrapper.text:
+                else:
+                    # 3x3 "select all images" — routed through the dynamic
+                    # handler, which clicks the matches then re-checks reloaded
+                    # tiles until none remain. If reCAPTCHA does not reload any
+                    # tiles (a plain one-time grid), _wait_for_new_dynamic_imgs
+                    # returns quickly and we just click verify once, so this
+                    # path also covers the static 3x3 case.
                     if verbose:
-                        print("found a 3x3 dynamic captcha")
+                        print("found a 3x3 select-all-images captcha")
                     img_urls = get_all_captcha_img_urls(driver)
+                    if verbose:
+                        print(
+                            f"dynamic: img count={len(img_urls)} "
+                            f"distinct={len(set(img_urls))}"
+                        )
                     download_img(0, img_urls[0])
-                    if is_classifier:
-                        answers = classify_grid_cells(target_set, 3, verbose, model)
-                    else:
-                        answers = dynamic_and_selection_solver(target_set, verbose, model)
+                    dynamic_model = model
+                    dynamic_target_set = target_set
+                    dynamic_is_classifier = is_classifier
+                    answers = []
+                    if is_classifier and fallback_path:
+                        if fallback is None:
+                            if verbose:
+                                print(f"loading fallback {fallback_path} for 3x3 detector")
+                            fallback = _try_load_yolo(fallback_path, verbose=verbose)
+                        if fallback is not None:
+                            fallback_target_set = get_target_classes(
+                                driver, fallback, verbose
+                            )
+                            if fallback_target_set:
+                                if verbose:
+                                    print("using fallback detector for 3x3 dynamic")
+                                answers = dynamic_and_selection_solver(
+                                    fallback_target_set, verbose, fallback
+                                )
+                                if answers:
+                                    dynamic_model = fallback
+                                    dynamic_target_set = fallback_target_set
+                                    dynamic_is_classifier = False
+                                elif verbose:
+                                    print(
+                                        "fallback detector produced no 3x3 answers; "
+                                        "falling back to classifier"
+                                    )
+                    if not answers:
+                        if is_classifier:
+                            answers = classify_grid_cells(target_set, 3, verbose, model)
+                        else:
+                            answers = dynamic_and_selection_solver(target_set, verbose, model)
                     if len(answers) >= 1:
+                        model = dynamic_model
+                        target_set = dynamic_target_set
+                        is_classifier = dynamic_is_classifier
                         captcha = "dynamic"
                         break
                     else:
-                        reload.click()
-                else:
-                    if verbose:
-                        print("found a 3x3 one time selection captcha")
-                    img_urls = get_all_captcha_img_urls(driver)
-                    download_img(0, img_urls[0])
-                    if is_classifier:
-                        answers = classify_grid_cells(target_set, 3, verbose, model)
-                    else:
-                        answers = dynamic_and_selection_solver(target_set, verbose, model)
-                    if len(answers) >= 1:
-                        captcha = "selection"
-                        break
-                    else:
+                        if verbose:
+                            print("dynamic: no usable answers, reloading")
                         reload.click()
                 WebDriverWait(driver, 10).until(
                     EC.element_to_be_clickable(
@@ -697,7 +786,9 @@ def solve_recaptcha(driver, verbose):
                             random_delay(mu=0.5, sigma=0.1)
                     else:
                         break
-            elif captcha == "selection" or captcha == "squares":
+            elif captcha == "squares":
+                if verbose:
+                    print(f"clicking {len(answers)} cell(s) for {captcha}: {answers}")
                 for answer in answers:
                     WebDriverWait(driver, 10).until(
                         EC.element_to_be_clickable(
@@ -713,6 +804,9 @@ def solve_recaptcha(driver, verbose):
                 EC.element_to_be_clickable((By.ID, "recaptcha-verify-button"))
             )
             random_delay(mu=2, sigma=0.2)
+            if verbose:
+                print(f"clicking verify button (captcha type={captcha})")
+            _dump_solve_diag(driver, captcha, answers, tag="pre-verify")
             verify.click()
 
             try:
@@ -727,6 +821,10 @@ def solve_recaptcha(driver, verbose):
                 driver.switch_to.default_content()
                 break
             except Exception:
+                if verbose:
+                    print(
+                        "verify did not yield solved state; re-entering challenge iframe"
+                    )
                 go_to_recaptcha_iframe2(driver)
         except Exception as e:
             # Transient errors (StaleElementReference, ElementNotInteractable,
@@ -760,6 +858,32 @@ def solve_recaptcha(driver, verbose):
                 # broken; fall through to the next outer-loop iteration which
                 # will hit the deadline check.
                 continue
+
+
+def _dump_solve_diag(driver, captcha, answers, tag=""):
+    """Debug aid: when RECAPTCHA_SOLVER_DIAG_DIR is set, snapshot the browser
+    viewport plus the composite image the classifier just scored, so a failed
+    solve can be eyeballed cell-by-cell against what the model chose. No-op
+    when the env var is unset."""
+    diag_dir = os.environ.get("RECAPTCHA_SOLVER_DIAG_DIR")
+    if not diag_dir:
+        return
+    try:
+        os.makedirs(diag_dir, exist_ok=True)
+        stamp = f"{int(monotonic() * 1000) % 100_000_000}"
+        if tag:
+            stamp = f"{stamp}-{tag}"
+        try:
+            driver.save_screenshot(os.path.join(diag_dir, f"{stamp}-view.png"))
+        except Exception:
+            pass
+        composite = "recaptcha_images/0.png"
+        if os.path.exists(composite):
+            shutil.copy(composite, os.path.join(diag_dir, f"{stamp}-grid.png"))
+        with open(os.path.join(diag_dir, f"{stamp}-meta.txt"), "w") as fh:
+            fh.write(f"captcha={captcha} answers={answers}\n")
+    except Exception as exc:
+        print(f"_dump_solve_diag failed: {exc!r}")
 
 
 def is_solved(driver) -> bool:
