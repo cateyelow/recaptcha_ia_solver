@@ -11,32 +11,71 @@ Flow per attempt:
 We DON'T pre-judge "headless = bad" — we only run with a visible display ($DISPLAY).
 The harness leaks no state between attempts (new browser per try) so the score
 reflects model+solver behavior, not warmed-up cookies.
+
+Plain undetected_chromedriver — no seleniumwire MITM, which Google's modern
+fingerprint analysis catches via TLS / CONNECT-pattern signals (you see the
+bot-detected NoScript-fallback iframe after a few attempts when MITM is active).
 """
 
 import os
+import re
+import shutil
+import subprocess
 import sys
 import time
 import traceback
 from pathlib import Path
 
-# Run from the repo root so `models/recaptcha_classifier.pt` resolves.
-PROJECT = Path(__file__).resolve().parent.parent
-os.chdir(PROJECT)
-sys.path.insert(0, str(PROJECT))
-
-# Plain undetected_chromedriver — no seleniumwire MITM, which Google's modern
-# fingerprint analysis catches via TLS / CONNECT-pattern signals (you see the
-# bot-detected NoScript-fallback iframe show up after a few attempts when MITM
-# is active).
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from recaptcha_ia_solver.solver import solve_recaptcha
+# Run from the repo root so `models/recaptcha_classifier.pt` resolves, and make
+# the package importable before pulling the solver in.
+PROJECT = Path(__file__).resolve().parent.parent
+os.chdir(PROJECT)
+sys.path.insert(0, str(PROJECT))
+
+from recaptcha_ia_solver.solver import solve_recaptcha  # noqa: E402
 
 
 DEMO_URL = "https://www.google.com/recaptcha/api2/demo?hl=en"
+
+
+def _resolve_chrome():
+    """Pick a stable Chrome binary and its real major version.
+
+    A box can carry several Chrome builds (e.g. a snap Chromium 149 and a deb
+    google-chrome 146). undetected_chromedriver auto-picks one binary and
+    separately fetches a chromedriver for ``version_main``; when those majors
+    differ every launch dies with "session not created: ... only supports Chrome
+    version N". So we pin an explicit binary (``RECAPTCHA_CHROME_BINARY``
+    override, else the usual google-chrome paths) and read its actual major so
+    the driver always matches the browser. Returns ``(path, major)`` with either
+    element ``None`` to let undetected_chromedriver auto-detect that part.
+    """
+    candidates = [
+        os.environ.get("RECAPTCHA_CHROME_BINARY"),
+        shutil.which("google-chrome"),
+        "/usr/bin/google-chrome",
+        "/opt/google/chrome/google-chrome",
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+    ]
+    for path in candidates:
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            out = subprocess.run(
+                [path, "--version"], capture_output=True, text=True, timeout=10
+            ).stdout
+        except Exception:
+            continue
+        m = re.search(r"\b(\d+)\.\d+\.\d+", out)
+        if m:
+            return path, int(m.group(1))
+    return None, None
 
 
 def make_driver(headless: bool = False):
@@ -52,11 +91,13 @@ def make_driver(headless: bool = False):
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--ignore-ssl-errors")
     options.add_argument("--allow-insecure-localhost")
-    driver = uc.Chrome(
-        options=options,
-        headless=headless,
-        version_main=146,
-    )
+    binary, major = _resolve_chrome()
+    kwargs = {"options": options, "headless": headless}
+    if binary:
+        kwargs["browser_executable_path"] = binary
+    if major:
+        kwargs["version_main"] = major
+    driver = uc.Chrome(**kwargs)
     driver.set_page_load_timeout(60)
     return driver
 

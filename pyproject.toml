@@ -13,8 +13,9 @@ authors = [{name = "cateyelow"}]
 keywords = ["recaptcha", "yolo", "selenium", "captcha", "computer-vision"]
 dependencies = [
   "numpy>=1.23",
-  "opencv-python>=4",
   "Pillow>=9",
+  # requests doubles as the HTTP client for the Gemini VLM recognizer, so the
+  # primary recognizer adds no new dependency (no google-generativeai SDK).
   "requests>=2",
   "ultralytics>=8",
   "selenium>=4",

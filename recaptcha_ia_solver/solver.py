@@ -7,7 +7,6 @@ from time import monotonic, sleep
 from typing import Iterable, Optional, Set
 
 # Third-party imports
-import cv2
 import numpy as np
 import requests
 from PIL import Image
@@ -16,6 +15,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.common.action_chains import ActionChains
+
+# Primary recognizer: a vision-language model that answers "which cells contain
+# the target?" directly from the composite (see recognizer.py for why a VLM
+# beats the single-label classifier on cluttered multi-object reCAPTCHA tiles).
+from recaptcha_ia_solver import recognizer
 
 # Primary model: fine-tuned classifier (scripts/train_classifier.py) trained
 # on the merged verytuffcat + DannyLuna reCAPTCHA datasets (~57k images).
@@ -369,7 +373,7 @@ def download_img(name, url):
     :param url: url of the image.
     """
 
-    response = requests.get(url, stream=True)
+    response = requests.get(url, stream=True, timeout=15)
     with open(f"recaptcha_images/{name}.png", "wb") as out_file:
         shutil.copyfileobj(response.raw, out_file)
     del response
@@ -408,7 +412,7 @@ def download_dynamic_grid_img(img_urls, grid_n=3):
 
     images = []
     for url in img_urls[:expected]:
-        response = requests.get(url)
+        response = requests.get(url, timeout=15)
         response.raise_for_status()
         images.append(Image.open(BytesIO(response.content)).convert("RGB"))
     _write_dynamic_grid_image(images, grid_n=grid_n)
@@ -459,7 +463,7 @@ def get_all_new_dynamic_captcha_img_urls(answers, before_img_urls, driver):
     for img in images:
         try:
             img_urls.append(img.get_attribute("src"))
-        except:
+        except Exception:
             is_new = False
             return is_new, img_urls
 
@@ -476,27 +480,6 @@ def get_all_new_dynamic_captcha_img_urls(answers, before_img_urls, driver):
     else:
         is_new = True
         return is_new, img_urls
-
-
-def paste_new_img_on_main_img(main, new, loc):
-    """
-    Paste the new image on the main image.
-    :param main: main image.
-    :param new: new image.
-    :param loc: location of the new image.
-    """
-    paste = np.copy(main)
-
-    row = (loc - 1) // 3
-    col = (loc - 1) % 3
-
-    start_row, end_row = row * 100, (row + 1) * 100
-    start_col, end_col = col * 100, (col + 1) * 100
-
-    paste[start_row:end_row, start_col:end_col] = new
-
-    paste = cv2.cvtColor(paste, cv2.COLOR_RGB2BGR)
-    cv2.imwrite("recaptcha_images/0.png", paste)
 
 
 def square_solver(target_set: Iterable[int], verbose, model):
@@ -545,6 +528,104 @@ def square_solver(target_set: Iterable[int], verbose, model):
     return sorted(answers)
 
 
+def _recognizer_mode() -> str:
+    """vlm | local | hybrid (default). hybrid = VLM first, YOLO on VLM failure."""
+    mode = os.environ.get("RECAPTCHA_RECOGNIZER", "hybrid").strip().lower()
+    return mode if mode in ("vlm", "local", "hybrid") else "hybrid"
+
+
+def get_challenge_phrase(driver, verbose: bool = False) -> str:
+    """Return the challenge target phrase (the bold word(s), e.g. 'fire hydrant',
+    '버스'). The VLM consumes this directly — no phrase->class table, so any
+    locale and any category resolves. Empty string if the title isn't present."""
+    try:
+        strong = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located(
+                (By.XPATH, '//div[@id="rc-imageselect"]//strong')
+            )
+        )
+        phrase = (strong.text or "").strip()
+    except Exception:
+        phrase = ""
+    if verbose:
+        print(f"challenge phrase={phrase!r}")
+    return phrase
+
+
+def _vlm_answers(phrase, grid_n, verbose, composite="recaptcha_images/0.png"):
+    """VLM cell picks for the current composite, or None to fall back to YOLO.
+
+    Returns None when the VLM is disabled (mode=local / no key) or fails after
+    retries; returns a (possibly empty) list of 1-indexed cells otherwise. An
+    empty list is a real answer: "this image has no more matches" — for a
+    dynamic grid that's the signal to verify."""
+    if _recognizer_mode() == "local" or not recognizer.vlm_enabled():
+        return None
+    return recognizer.recognize_cells(composite, phrase, grid_n, verbose=verbose)
+
+
+def _is_dead_driver_error(exc: Exception) -> bool:
+    """True for errors that mean the browser/driver is gone for good (process
+    crashed, session deleted, connection refused). Retrying these just burns the
+    whole deadline doing nothing — the caller aborts immediately instead."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    needles = (
+        "max retries exceeded",
+        "connection refused",
+        "failed to establish a new connection",
+        "chrome not reachable",
+        "invalid session id",
+        "session deleted",
+        "no such window",
+        "disconnected",
+        "tab crashed",
+        "cannot determine loading status",
+    )
+    return any(n in text for n in needles)
+
+
+def _human_click(driver, element, mu=0.4, sigma=0.15):
+    """Click `element` with a short curved mouse approach + variable dwell.
+
+    reCAPTCHA scores cursor telemetry: teleport-then-click (raw .click()) reads
+    as a bot and drives the trust score down, which is what escalates a session
+    into the hardest, near-unsolvable challenge loops. A couple of intermediate
+    moves with jittered offsets and human-scale pauses emit the mousemove
+    stream a real click produces. Falls back to a plain click if ActionChains
+    can't run (e.g. headless without a virtual cursor)."""
+    try:
+        chain = ActionChains(driver)
+        for _ in range(np.random.randint(2, 4)):
+            dx = int(np.random.randint(-18, 19))
+            dy = int(np.random.randint(-18, 19))
+            try:
+                chain.move_to_element_with_offset(element, dx, dy)
+            except Exception:
+                chain.move_to_element(element)
+            chain.pause(max(0.03, float(np.random.normal(0.12, 0.05))))
+        chain.move_to_element(element)
+        chain.pause(max(0.04, float(np.random.normal(mu * 0.5, sigma * 0.5))))
+        chain.click()
+        chain.perform()
+    except Exception:
+        try:
+            element.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", element)
+    random_delay(mu=mu, sigma=sigma)
+
+
+def _click_cells(driver, answers):
+    """Human-click each 1-indexed grid cell in `answers` (td order)."""
+    for answer in answers:
+        cell = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable(
+                (By.XPATH, f'(//div[@id="rc-imageselect-target"]//td)[{answer}]')
+            )
+        )
+        _human_click(driver, cell, mu=0.45, sigma=0.18)
+
+
 def solve_recaptcha(driver, verbose):
     """
     Solve the recaptcha.
@@ -559,66 +640,123 @@ def solve_recaptcha(driver, verbose):
             (By.XPATH, '//div[@class="recaptcha-checkbox-border"]')
         )
     )
+    check_box = driver.find_element(
+        By.XPATH, '//div[@class="recaptcha-checkbox-border"]'
+    )
+    _human_click(driver, check_box, mu=0.6, sigma=0.2)
 
-    action_chain = ActionChains(driver)
-    check_box = driver.find_element(By.XPATH, '//div[@class="recaptcha-checkbox-border"]')
-    action_chain.move_to_element(check_box).click().perform()
+    # High-trust sessions verify on the checkbox alone — no image challenge ever
+    # appears. Check briefly before paying for the challenge path.
+    try:
+        WebDriverWait(driver, 3).until(
+            EC.presence_of_element_located(
+                (By.XPATH, '//span[contains(@aria-checked, "true")]')
+            )
+        )
+        if verbose:
+            print("solved on checkbox alone (no image challenge)")
+        driver.switch_to.default_content()
+        return
+    except Exception:
+        pass
 
     go_to_recaptcha_iframe2(driver)
 
+    mode = _recognizer_mode()
+    use_vlm = mode in ("vlm", "hybrid") and recognizer.vlm_enabled()
+
+    # Local YOLO is the fallback (or the only path in mode=local). Skip the
+    # ~150 MB model load entirely in pure-VLM mode.
+    primary = None
+    fallback = None
     primary_path = os.environ.get("RECAPTCHA_YOLO_MODEL", DEFAULT_YOLO_MODEL)
     fallback_path = os.environ.get(
         "RECAPTCHA_YOLO_FALLBACK", DEFAULT_YOLO_FALLBACK_MODEL
     )
-    primary = _try_load_yolo(primary_path, verbose=verbose)
-    if primary is None:
-        # Primary missing — promote fallback so the solver still runs.
-        primary = _try_load_yolo(fallback_path, verbose=verbose)
-        fallback_path = ""
+    if mode != "vlm":
+        primary = _try_load_yolo(primary_path, verbose=verbose)
         if primary is None:
-            raise RuntimeError(
-                f"could not load any reCAPTCHA model "
-                f"(tried RECAPTCHA_YOLO_MODEL and RECAPTCHA_YOLO_FALLBACK)"
-            )
-    fallback = None  # lazy-loaded only when a target term misses the primary
+            primary = _try_load_yolo(fallback_path, verbose=verbose)
+            fallback_path = ""
+    if primary is None and not use_vlm:
+        raise RuntimeError(
+            "could not load any reCAPTCHA recognizer "
+            "(no VLM key available and no local YOLO model loaded)"
+        )
     if verbose:
         print(
-            f"loaded primary={primary_path} task={getattr(primary, 'task', '?')}; "
-            f"fallback={fallback_path or 'disabled'}"
+            f"recognizer mode={mode} use_vlm={use_vlm} "
+            f"local={getattr(primary, 'task', None)} fallback={fallback_path or 'off'}"
         )
 
     os.makedirs("recaptcha_images", exist_ok=True)
 
-    # Hard wall-clock bound: at this point we've already accepted that we
-    # cannot solve this challenge tree (e.g., reCAPTCHA keeps failing our
-    # verifies and re-issuing new challenges). Give up so the caller can
-    # decide whether to retry from scratch instead of hanging forever.
+    # Hard wall-clock bound so a pathological challenge tree (reCAPTCHA keeps
+    # rejecting and re-issuing) can't hang forever; the caller decides whether
+    # to retry from scratch.
     try:
         deadline_seconds = float(os.environ.get("RECAPTCHA_SOLVER_DEADLINE_SEC", "120"))
     except ValueError:
         deadline_seconds = 120.0
     overall_deadline = monotonic() + deadline_seconds
+    # Bounded reloads: a string of empty answers used to reload until the
+    # deadline (and excessive reloads themselves raise reCAPTCHA's suspicion).
+    try:
+        max_reloads = int(os.environ.get("RECAPTCHA_MAX_RELOADS", "12"))
+    except ValueError:
+        max_reloads = 12
+    reloads = 0
 
-    while True:
-        if monotonic() > overall_deadline:
-            if verbose:
-                print("solve_recaptcha overall deadline reached, giving up")
-            break
+    def _local_answers(grid_n):
+        """YOLO fallback cell picks for the current composite (1-indexed)."""
+        nonlocal fallback
+        if primary is None:
+            return []
+        target_set = get_target_classes(driver, primary, verbose)
+        model = primary
+        # 4x4 cross-tile needs a detector (per-cell classification of a 1/16
+        # slice is meaningless); prefer the OIV7 fallback there.
+        want_detect = grid_n >= 4
+        if (not target_set or want_detect) and fallback_path:
+            if fallback is None:
+                fallback = _try_load_yolo(fallback_path, verbose=verbose)
+            if fallback is not None:
+                fb_set = get_target_classes(driver, fallback, verbose)
+                if fb_set:
+                    target_set, model = fb_set, fallback
+        if not target_set:
+            return []
+        if getattr(model, "task", None) == "classify":
+            return classify_grid_cells(target_set, grid_n, verbose, model)
+        if grid_n >= 4:
+            return square_solver(target_set, verbose, model)
+        return dynamic_and_selection_solver(target_set, verbose, model)
+
+    def _answers_for_current(phrase, grid_n):
+        """VLM first, YOLO fallback. List (maybe empty) of 1-indexed cells."""
+        if use_vlm:
+            cells = _vlm_answers(phrase, grid_n, verbose)
+            if cells is not None:
+                return cells
+        return _local_answers(grid_n)
+
+    while monotonic() < overall_deadline:
         try:
-            while True:
+            captcha = None
+            answers = []
+            img_urls = []
+            phrase = ""
+            grid_n = 3
+            # ---- choose a challenge we can actually answer ----
+            while monotonic() < overall_deadline:
                 reload = WebDriverWait(driver, 10).until(
                     EC.element_to_be_clickable((By.ID, "recaptcha-reload-button"))
                 )
                 title_wrapper = WebDriverWait(driver, 10).until(
                     EC.presence_of_element_located((By.ID, "rc-imageselect"))
                 )
-                # Grid size + challenge type, detected structurally. The
-                # upstream string checks ("squares"/"none" in title) only work
-                # for an English-locale widget; IG serves reCAPTCHA in Korean
-                # (hl=ko) so they never matched — every challenge fell through
-                # to the 3x3-one-time branch, and 4x4 grids got sliced 3x3 into
-                # garbage cells. The <td> count is locale-proof: 16 tds = 4x4
-                # "select all squares", 9 = 3x3 "select all images".
+                # <td> count is locale-proof: 16 = 4x4 "select all squares",
+                # 9 = 3x3 "select all images" (title strings are localized).
                 try:
                     td_count = len(
                         driver.find_elements(
@@ -628,230 +766,86 @@ def solve_recaptcha(driver, verbose):
                 except Exception:
                     td_count = -1
                 grid_n = 4 if td_count >= 16 else 3
+                phrase = get_challenge_phrase(driver, verbose)
                 if verbose:
                     print(
-                        f"challenge wrapper: td_count={td_count} "
-                        f"grid={grid_n}x{grid_n} text={title_wrapper.text!r}"
+                        f"challenge: td={td_count} grid={grid_n}x{grid_n} "
+                        f"phrase={phrase!r} text={title_wrapper.text!r}"
                     )
 
-                target_set = get_target_classes(driver, primary, verbose)
-                model = primary
-                if not target_set and fallback_path:
-                    if fallback is None:
-                        if verbose:
-                            print(f"loading fallback {fallback_path}")
-                        fallback = _try_load_yolo(fallback_path, verbose=verbose)
-                    if fallback is not None:
-                        target_set = get_target_classes(driver, fallback, verbose)
-                        if target_set:
-                            model = fallback
-                is_classifier = getattr(model, "task", None) == "classify"
+                img_urls = get_all_captcha_img_urls(driver)
+                # download_dynamic_grid_img composes distinct dynamic tiles into
+                # one grid and falls back to the single composite URL otherwise —
+                # correct for static 3x3, dynamic 3x3, and the one-image 4x4.
+                # Pass the real grid_n: a 4x4 with distinct tile URLs must be
+                # composed as 16 cells, not sliced to the first 9 as a 3x3.
+                download_dynamic_grid_img(img_urls, grid_n=grid_n)
+                answers = _answers_for_current(phrase, grid_n)
 
-                if not target_set:
-                    random_delay()
+                # A 4x4 answer of all 16 cells is virtually always VLM
+                # over-selection (a real "every square matches" challenge does
+                # not occur), so treat it as unusable and reload rather than
+                # click all 16 and guarantee a reject.
+                usable = len(answers) >= 1 and (grid_n < 4 or len(answers) < 16)
+                if usable:
+                    captcha = "squares" if grid_n >= 4 else "dynamic"
+                    break
+
+                reloads += 1
+                if reloads > max_reloads:
                     if verbose:
-                        print("skipping (no supported category in challenge)")
-                    reload.click()
-                elif grid_n == 4:
-                    if verbose:
-                        print("found a 4x4 select-all-squares captcha")
-                    img_urls = get_all_captcha_img_urls(driver)
-                    if verbose:
-                        print(
-                            f"squares: img count={len(img_urls)} "
-                            f"distinct={len(set(img_urls))}"
-                        )
-                    download_dynamic_grid_img(img_urls, grid_n=3)
-                    answers = []
-                    if is_classifier and fallback_path:
-                        if fallback is None:
-                            if verbose:
-                                print(f"loading fallback {fallback_path} for 4x4 detector")
-                            fallback = _try_load_yolo(fallback_path, verbose=verbose)
-                        if fallback is not None:
-                            fallback_target_set = get_target_classes(
-                                driver, fallback, verbose
-                            )
-                            if fallback_target_set:
-                                if verbose:
-                                    print("using fallback detector for 4x4 squares")
-                                answers = square_solver(
-                                    fallback_target_set, verbose, fallback
-                                )
-                                if verbose and not (len(answers) >= 1 and len(answers) < 16):
-                                    print(
-                                        "fallback detector produced no usable 4x4 answers; "
-                                        "falling back to classifier"
-                                    )
-                    if not (len(answers) >= 1 and len(answers) < 16):
-                        if is_classifier:
-                            answers = classify_grid_cells(target_set, 4, verbose, model)
-                        else:
-                            answers = square_solver(target_set, verbose, model)
-                    if len(answers) >= 1 and len(answers) < 16:
-                        captcha = "squares"
-                        break
-                    else:
-                        if verbose:
-                            print("squares: no usable answers, reloading")
-                        reload.click()
-                else:
-                    # 3x3 "select all images" — routed through the dynamic
-                    # handler, which clicks the matches then re-checks reloaded
-                    # tiles until none remain. If reCAPTCHA does not reload any
-                    # tiles (a plain one-time grid), _wait_for_new_dynamic_imgs
-                    # returns quickly and we just click verify once, so this
-                    # path also covers the static 3x3 case.
-                    if verbose:
-                        print("found a 3x3 select-all-images captcha")
-                    img_urls = get_all_captcha_img_urls(driver)
-                    if verbose:
-                        print(
-                            f"dynamic: img count={len(img_urls)} "
-                            f"distinct={len(set(img_urls))}"
-                        )
-                    download_img(0, img_urls[0])
-                    dynamic_model = model
-                    dynamic_target_set = target_set
-                    dynamic_is_classifier = is_classifier
-                    answers = []
-                    if is_classifier and fallback_path:
-                        if fallback is None:
-                            if verbose:
-                                print(f"loading fallback {fallback_path} for 3x3 detector")
-                            fallback = _try_load_yolo(fallback_path, verbose=verbose)
-                        if fallback is not None:
-                            fallback_target_set = get_target_classes(
-                                driver, fallback, verbose
-                            )
-                            if fallback_target_set:
-                                if verbose:
-                                    print("using fallback detector for 3x3 dynamic")
-                                answers = dynamic_and_selection_solver(
-                                    fallback_target_set, verbose, fallback
-                                )
-                                if answers:
-                                    dynamic_model = fallback
-                                    dynamic_target_set = fallback_target_set
-                                    dynamic_is_classifier = False
-                                elif verbose:
-                                    print(
-                                        "fallback detector produced no 3x3 answers; "
-                                        "falling back to classifier"
-                                    )
-                    if not answers:
-                        if is_classifier:
-                            answers = classify_grid_cells(target_set, 3, verbose, model)
-                        else:
-                            answers = dynamic_and_selection_solver(target_set, verbose, model)
-                    if len(answers) >= 1:
-                        model = dynamic_model
-                        target_set = dynamic_target_set
-                        is_classifier = dynamic_is_classifier
-                        captcha = "dynamic"
-                        break
-                    else:
-                        if verbose:
-                            print("dynamic: no usable answers, reloading")
-                        reload.click()
+                        print(f"exceeded {max_reloads} reloads, giving up")
+                    driver.switch_to.default_content()
+                    return
+                if verbose:
+                    print(
+                        f"no usable answers ({answers}); reload {reloads}/{max_reloads}"
+                    )
+                random_delay()
+                reload.click()
                 WebDriverWait(driver, 10).until(
                     EC.element_to_be_clickable(
                         (By.XPATH, '(//div[@id="rc-imageselect-target"]//td)[1]')
                     )
                 )
 
+            if captcha is None:
+                break
+
+            _click_cells(driver, answers)
+
             if captcha == "dynamic":
-                for answer in answers:
-                    WebDriverWait(driver, 10).until(
-                        EC.element_to_be_clickable(
-                            (
-                                By.XPATH,
-                                f'(//div[@id="rc-imageselect-target"]//td)[{answer}]',
-                            )
-                        )
-                    ).click()
-                    random_delay(mu=0.5, sigma=0.2)
-                # Outer dynamic-loop deadline: hard cap so no edge case (cells
-                # removed, network stall, reCAPTCHA already verified) keeps us
-                # spinning forever waiting for refreshed thumbnails.
-                dynamic_deadline = monotonic() + 60
+                # Dynamic fade-in: after each click round, re-fetch + re-compose
+                # the whole grid, re-recognize, click new matches, until none
+                # remain or the bounded deadline trips. Re-composing the full
+                # grid each round avoids the fragile hard-coded-100px tile-paste.
+                dynamic_deadline = monotonic() + min(60, deadline_seconds)
                 while monotonic() < dynamic_deadline:
-                    before_img_urls = img_urls
                     is_new, img_urls = _wait_for_new_dynamic_imgs(
-                        answers, before_img_urls, driver
+                        answers, img_urls, driver
                     )
                     if not is_new:
-                        # No fresh thumbnails arrived — challenge likely already
-                        # transitioned to "verify"; bail and let outer success
-                        # check decide.
                         break
-
-                    new_img_index_urls = [answer - 1 for answer in answers]
-
-                    for index in new_img_index_urls:
-                        download_img(index + 1, img_urls[index])
-                    paste_deadline = monotonic() + 15
-                    while monotonic() < paste_deadline:
-                        try:
-                            for answer in answers:
-                                main_img = Image.open("recaptcha_images/0.png")
-                                new_img = Image.open(f"recaptcha_images/{answer}.png")
-                                location = answer
-                                paste_new_img_on_main_img(main_img, new_img, location)
-                            break
-                        except Exception:
-                            is_new, img_urls = _wait_for_new_dynamic_imgs(
-                                answers, before_img_urls, driver
-                            )
-                            if not is_new:
-                                break
-                            for index in [answer - 1 for answer in answers]:
-                                download_img(index + 1, img_urls[index])
-
-                    if is_classifier:
-                        answers = classify_grid_cells(target_set, 3, verbose, model)
-                    else:
-                        answers = dynamic_and_selection_solver(target_set, verbose, model)
-
-                    if len(answers) >= 1:
-                        for answer in answers:
-                            WebDriverWait(driver, 10).until(
-                                EC.element_to_be_clickable(
-                                    (
-                                        By.XPATH,
-                                        f'(//div[@id="rc-imageselect-target"]//td)[{answer}]',
-                                    )
-                                )
-                            ).click()
-                            random_delay(mu=0.5, sigma=0.1)
-                    else:
+                    fresh_urls = get_all_captcha_img_urls(driver)
+                    download_dynamic_grid_img(fresh_urls, grid_n=grid_n)
+                    img_urls = fresh_urls
+                    answers = _answers_for_current(phrase, grid_n)
+                    if not answers:
                         break
-            elif captcha == "squares":
-                if verbose:
-                    print(f"clicking {len(answers)} cell(s) for {captcha}: {answers}")
-                for answer in answers:
-                    WebDriverWait(driver, 10).until(
-                        EC.element_to_be_clickable(
-                            (
-                                By.XPATH,
-                                f'(//div[@id="rc-imageselect-target"]//td)[{answer}]',
-                            )
-                        )
-                    ).click()
-                    random_delay()
+                    _click_cells(driver, answers)
 
             verify = WebDriverWait(driver, 10).until(
                 EC.element_to_be_clickable((By.ID, "recaptcha-verify-button"))
             )
-            random_delay(mu=2, sigma=0.2)
+            random_delay(mu=1.2, sigma=0.3)
             if verbose:
-                print(f"clicking verify button (captcha type={captcha})")
+                print(f"clicking verify (type={captcha}, answers={answers})")
             _dump_solve_diag(driver, captcha, answers, tag="pre-verify")
-            verify.click()
+            _human_click(driver, verify, mu=0.5, sigma=0.2)
 
             try:
                 go_to_recaptcha_iframe1(driver)
-                WebDriverWait(driver, 4).until(
+                WebDriverWait(driver, 5).until(
                     EC.presence_of_element_located(
                         (By.XPATH, '//span[contains(@aria-checked, "true")]')
                     )
@@ -862,24 +856,28 @@ def solve_recaptcha(driver, verbose):
                 break
             except Exception:
                 if verbose:
-                    print(
-                        "verify did not yield solved state; re-entering challenge iframe"
-                    )
+                    print("verify did not solve; re-entering challenge iframe")
                 go_to_recaptcha_iframe2(driver)
         except Exception as e:
-            # Transient errors (StaleElementReference, ElementNotInteractable,
-            # WebDriverWait timeouts on a single element) used to break out of
-            # the outer loop unconditionally — that returned a "solved looking"
-            # state to callers even though the checkbox was never verified.
-            # Now we soak up the error, re-anchor on the challenge iframe, and
-            # let `overall_deadline` decide when to actually give up.
+            # A dead browser/driver (crash, session gone, connection refused)
+            # can't be retried — bail immediately instead of burning the whole
+            # deadline re-throwing the same connection error. But a
+            # requests.RequestException comes from our own tile downloads (an
+            # image-server hiccup), NOT the webdriver — its "Max retries" /
+            # "connection" text must not trip the abort, so exclude it and let
+            # it fall through to the transient re-anchor path.
+            if (not isinstance(e, requests.exceptions.RequestException)
+                    and _is_dead_driver_error(e)):
+                if verbose:
+                    print(f"driver/browser is dead, aborting: {e!r}")
+                break
+            # Transient errors (StaleElementReference, timeouts): re-anchor on
+            # the challenge iframe and let `overall_deadline` decide when to quit.
             if verbose:
                 print(f"transient error in solve loop, retrying: {e!r}")
             sleep(0.5)
             try:
                 go_to_recaptcha_iframe1(driver)
-                # If the checkbox already shows verified, accept the success
-                # even though the loop saw an error mid-flight.
                 WebDriverWait(driver, 2).until(
                     EC.presence_of_element_located(
                         (By.XPATH, '//span[contains(@aria-checked, "true")]')
@@ -894,9 +892,6 @@ def solve_recaptcha(driver, verbose):
             try:
                 go_to_recaptcha_iframe2(driver)
             except Exception:
-                # iframe2 is gone too — could be either solved or completely
-                # broken; fall through to the next outer-loop iteration which
-                # will hit the deadline check.
                 continue
 
 
