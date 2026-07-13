@@ -183,6 +183,209 @@ def test_write_dynamic_grid_image_composes_individual_tiles(tmp_path, monkeypatc
     assert composed.getpixel((25, 25)) == (8, 18, 28)
 
 
+def test_download_dynamic_grid_prefers_screenshot_for_shared_urls(monkeypatch):
+    """A rendered 3x3 grid can reuse one composite URL for all nine cells.
+
+    When screenshot mode is enabled, the browser rendering is authoritative
+    and must be captured before the URL-shape shortcuts.  Otherwise the solver
+    bypasses the matching browser proxy and can block in a direct HTTP fetch.
+    """
+    from recaptcha_ia_solver import solver as M
+
+    driver = object()
+    screenshots = []
+    monkeypatch.setenv("RECAPTCHA_DYNAMIC_SCREENSHOT", "1")
+    monkeypatch.setattr(
+        M,
+        "_screenshot_grid_to_png",
+        lambda actual_driver: screenshots.append(actual_driver) or True,
+    )
+    monkeypatch.setattr(
+        M,
+        "download_img",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("URL download used before browser screenshot")
+        ),
+    )
+
+    M.download_dynamic_grid_img(["https://example.test/composite"] * 9, 3, driver)
+
+    assert screenshots == [driver]
+
+
+def test_get_all_captcha_img_urls_uses_one_browser_script_call():
+    """Remote CDP drivers must not pay one WebDriver round-trip per tile."""
+    from recaptcha_ia_solver import solver as M
+
+    urls = [f"https://example.test/{idx}.png" for idx in range(9)]
+
+    class FakeImage:
+        def get_attribute(self, name):
+            raise AssertionError(f"per-element get_attribute used for {name}")
+
+    class FakeDriver:
+        def __init__(self):
+            self.scripts = []
+
+        def execute_script(self, script):
+            self.scripts.append(script)
+            return urls
+
+        def find_elements(self, *args, **kwargs):
+            return [FakeImage() for _ in range(9)]
+
+    driver = FakeDriver()
+
+    assert M.get_all_captcha_img_urls(driver) == urls
+    assert len(driver.scripts) == 1
+    assert "querySelectorAll" in driver.scripts[0]
+
+
+def test_get_all_new_dynamic_captcha_urls_reuses_single_browser_script_call():
+    """Dynamic polling must not restore one remote round-trip per tile."""
+    from recaptcha_ia_solver import solver as M
+
+    before = [f"https://example.test/before-{idx}.png" for idx in range(9)]
+    current = before.copy()
+    current[1] = "https://example.test/after-1.png"
+    current[4] = "https://example.test/after-4.png"
+
+    class FakeDriver:
+        def __init__(self):
+            self.scripts = []
+
+        def execute_script(self, script):
+            self.scripts.append(script)
+            return current
+
+        def find_elements(self, *_args, **_kwargs):
+            raise AssertionError("per-element dynamic URL lookup used")
+
+    driver = FakeDriver()
+
+    is_new, urls = M.get_all_new_dynamic_captcha_img_urls(
+        [2, 5], before, driver
+    )
+
+    assert is_new is True
+    assert urls == current
+    assert len(driver.scripts) == 1
+
+
+def test_get_all_new_dynamic_captcha_urls_keeps_script_fallback():
+    """Drivers without script support still use the legacy element path."""
+    from recaptcha_ia_solver import solver as M
+
+    before = [f"https://example.test/before-{idx}.png" for idx in range(9)]
+    current = before.copy()
+    current[2] = "https://example.test/after-2.png"
+
+    class FakeImage:
+        def __init__(self, url):
+            self.url = url
+
+        def get_attribute(self, name):
+            assert name == "src"
+            return self.url
+
+    class FakeDriver:
+        def execute_script(self, _script):
+            raise RuntimeError("script unsupported")
+
+        def find_elements(self, *_args, **_kwargs):
+            return [FakeImage(url) for url in current]
+
+    is_new, urls = M.get_all_new_dynamic_captcha_img_urls(
+        [3], before, FakeDriver()
+    )
+
+    assert is_new is True
+    assert urls == current
+
+
+def test_click_cells_batches_element_lookup_and_action_chain_perform(monkeypatch):
+    """Remote CDP must pay one lookup and one perform for a click batch."""
+    from recaptcha_ia_solver import solver as M
+
+    class FakeElement:
+        def __init__(self, index):
+            self.index = index
+
+        def is_displayed(self):
+            return True
+
+        def is_enabled(self):
+            return True
+
+        def click(self):
+            raise AssertionError("plain element click fallback used")
+
+    class FakeDriver:
+        def __init__(self):
+            self.cells = [FakeElement(index) for index in range(1, 10)]
+            self.find_element_calls = 0
+            self.find_elements_calls = 0
+
+        def find_element(self, _by, xpath):
+            self.find_element_calls += 1
+            index = int(xpath.rsplit("[", 1)[1].rstrip("]"))
+            return self.cells[index - 1]
+
+        def find_elements(self, _by, _xpath):
+            self.find_elements_calls += 1
+            return self.cells
+
+        def execute_script(self, *_args):
+            raise AssertionError("JavaScript click fallback used")
+
+    class FakeActionChains:
+        instances = []
+        perform_calls = 0
+
+        def __init__(self, driver):
+            self.driver = driver
+            self.current = None
+            self.click_targets = []
+            self.offset_moves = 0
+            self.pauses = 0
+            self.__class__.instances.append(self)
+
+        def move_to_element_with_offset(self, element, _dx, _dy):
+            self.current = element
+            self.offset_moves += 1
+            return self
+
+        def move_to_element(self, element):
+            self.current = element
+            return self
+
+        def pause(self, _seconds):
+            self.pauses += 1
+            return self
+
+        def click(self):
+            self.click_targets.append(self.current.index)
+            return self
+
+        def perform(self):
+            self.__class__.perform_calls += 1
+
+    driver = FakeDriver()
+    monkeypatch.setattr(M, "ActionChains", FakeActionChains)
+    monkeypatch.setattr(M, "random_delay", lambda **_kwargs: None)
+
+    M._click_cells(driver, [1, 3, 5])
+
+    assert driver.find_element_calls == 0
+    assert driver.find_elements_calls == 1
+    assert len(FakeActionChains.instances) == 1
+    chain = FakeActionChains.instances[0]
+    assert FakeActionChains.perform_calls == 1
+    assert chain.click_targets == [1, 3, 5]
+    assert chain.offset_moves >= 2 * 3
+    assert chain.pauses >= 3 * 3
+
+
 def test_classify_grid_cells_4x4(tmp_path, monkeypatch):
     """4x4 squares-mode also works through the same code path."""
     import os

@@ -353,6 +353,19 @@ def get_all_captcha_img_urls(driver):
     """
     Get all the image urls from the recaptcha.
     """
+    try:
+        urls = driver.execute_script(
+            "return Array.from(document.querySelectorAll("
+            "'#rc-imageselect-target img')).map(function (img) { "
+            "return img.src || ''; });"
+        )
+        if isinstance(urls, list) and urls:
+            return [str(url or "") for url in urls]
+    except Exception:
+        # Older/fake drivers may not expose execute_script in this frame.
+        # Keep the original element path as a compatibility fallback.
+        pass
+
     images = WebDriverWait(driver, 10).until(
         EC.presence_of_all_elements_located(
             (By.XPATH, '//div[@id="rc-imageselect-target"]//img')
@@ -395,14 +408,58 @@ def _write_dynamic_grid_image(images, grid_n=3, out_path="recaptcha_images/0.png
     canvas.save(out_path)
 
 
-def download_dynamic_grid_img(img_urls, grid_n=3):
+def _use_screenshot_compose():
+    """Compose the dynamic grid from a live element screenshot rather than
+    re-fetching per-cell URLs. A/B toggle; default off = legacy URL compose.
+
+    Dynamic 3x3 shares ONE composite URL across the un-clicked cells (measured
+    live: distinct=4 dominates), so the URL-fetch composite duplicates a tile
+    into several positions and the VLM over-selects the repeats — which is why
+    the legacy path then has to bail on distinct < n*n. Screenshotting the
+    rendered grid is correct regardless of URL distinctness.
+    """
+    return os.environ.get("RECAPTCHA_DYNAMIC_SCREENSHOT", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _screenshot_grid_to_png(driver, out_path="recaptcha_images/0.png"):
+    """Capture the rendered challenge grid as one image (what the user sees).
+
+    Sidesteps URL semantics entirely: shared composite URLs still render as
+    distinct tiles on screen, exactly the reason the static composite path
+    works. Returns True on success, False so the caller can fall back to the
+    URL-fetch composite if the element screenshot is unavailable.
+    """
+    try:
+        target = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.ID, "rc-imageselect-target"))
+        )
+        png = target.screenshot_as_png
+        Image.open(BytesIO(png)).convert("RGB").save(out_path)
+        return True
+    except Exception:
+        return False
+
+
+def download_dynamic_grid_img(img_urls, grid_n=3, driver=None):
     """Download the current 3x3 challenge as recaptcha_images/0.png.
 
     Static 3x3 challenges expose one composite URL repeated nine times.
     Dynamic challenges expose separate tile URLs; compose them before model
     inference so the grid math maps boxes/classes to the real cell positions.
+    When the screenshot toggle is on, dynamic/4x4 grids are captured straight
+    from the rendered element instead (driver required).
     """
     expected = grid_n * grid_n
+    if driver is not None and _use_screenshot_compose():
+        if _screenshot_grid_to_png(driver):
+            return
+        # screenshot failed — fall through to the legacy URL-fetch composite
+
     if len(img_urls) < expected:
         download_img(0, img_urls[0])
         return
@@ -446,26 +503,40 @@ def _wait_for_new_dynamic_imgs(answers, before_img_urls, driver, max_wait_s=15):
     return False, img_urls
 
 
+def _wait_for_settled_dynamic_grid(driver, grid_n, max_wait_s=8):
+    """Return the tile URLs only once the fade-in transition has settled.
+
+    `_wait_for_new_dynamic_imgs` confirms the *answered* cells changed, but the
+    other cells can still be mid-fade at that instant, and during a transition
+    reCAPTCHA briefly serves several cells the SAME (placeholder/prior) URL. A
+    snapshot taken then has distinct << n*n, so `download_dynamic_grid_img`
+    composes the same tile into multiple positions and the VLM over-selects
+    every repeat (measured live: distinct=4 -> a 7-of-9 over-select). Poll until
+    every cell shows a distinct URL (settled) or `max_wait_s` elapses
+    (fail-open: a grid that legitimately repeats a tile must not hang forever).
+    """
+    expected = grid_n * grid_n
+    deadline = monotonic() + max_wait_s
+    urls = get_all_captcha_img_urls(driver)
+    while monotonic() < deadline and len(set(urls[:expected])) < expected:
+        sleep(0.3)
+        urls = get_all_captcha_img_urls(driver)
+    return urls
+
+
 def get_all_new_dynamic_captcha_img_urls(answers, before_img_urls, driver):
     """
     Get all the new image urls from the recaptcha.
     :param answers: answers from the recaptcha.
     :param before_img_urls: image urls before.
     """
-    images = WebDriverWait(driver, 10).until(
-        EC.presence_of_all_elements_located(
-            (By.XPATH, '//div[@id="rc-imageselect-target"]//img')
-        )
-    )
-    img_urls = []
-
-    # Get all the image urls
-    for img in images:
-        try:
-            img_urls.append(img.get_attribute("src"))
-        except Exception:
-            is_new = False
-            return is_new, img_urls
+    try:
+        # Reuse the batched browser-script path. On forwarded remote CDP each
+        # WebElement.get_attribute call is a network round-trip, and this
+        # function runs repeatedly inside a 0.3-second polling loop.
+        img_urls = get_all_captcha_img_urls(driver)
+    except Exception:
+        return False, []
 
     # Check if the image urls are the same as before
     index_common = []
@@ -616,14 +687,52 @@ def _human_click(driver, element, mu=0.4, sigma=0.15):
 
 
 def _click_cells(driver, answers):
-    """Human-click each 1-indexed grid cell in `answers` (td order)."""
-    for answer in answers:
-        cell = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable(
-                (By.XPATH, f'(//div[@id="rc-imageselect-target"]//td)[{answer}]')
-            )
-        )
-        _human_click(driver, cell, mu=0.45, sigma=0.18)
+    """Human-click selected grid cells with one remote lookup/action batch."""
+    answers = list(answers)
+    if not answers:
+        return
+
+    indices = [int(answer) - 1 for answer in answers]
+    if any(index < 0 for index in indices):
+        raise ValueError(f"cell answers must be 1-indexed: {answers!r}")
+
+    locator = (By.XPATH, '//div[@id="rc-imageselect-target"]//td')
+    required = max(indices) + 1
+
+    def _enough_cells(current_driver):
+        cells = current_driver.find_elements(*locator)
+        return cells if len(cells) >= required else False
+
+    cells = WebDriverWait(driver, 10).until(_enough_cells)
+    selected = [cells[index] for index in indices]
+
+    try:
+        chain = ActionChains(driver)
+        for cell in selected:
+            for _ in range(np.random.randint(2, 4)):
+                dx = int(np.random.randint(-18, 19))
+                dy = int(np.random.randint(-18, 19))
+                try:
+                    chain.move_to_element_with_offset(cell, dx, dy)
+                except Exception:
+                    chain.move_to_element(cell)
+                chain.pause(max(0.03, float(np.random.normal(0.12, 0.05))))
+            chain.move_to_element(cell)
+            chain.pause(max(0.04, float(np.random.normal(0.225, 0.09))))
+            chain.click()
+            # `_human_click(..., mu=0.45, sigma=0.18)` slept after each
+            # perform. Keep the same inter-click timing inside this one batch.
+            chain.pause(max(0.1, float(np.random.normal(0.45, 0.18))))
+        chain.perform()
+    except Exception:
+        # Match _human_click's headless fallback without paying one ActionChains
+        # command per cell on the normal remote-CDP path.
+        for cell in selected:
+            try:
+                cell.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", cell)
+            random_delay(mu=0.45, sigma=0.18)
 
 
 def solve_recaptcha(driver, verbose):
@@ -779,14 +888,20 @@ def solve_recaptcha(driver, verbose):
                 # correct for static 3x3, dynamic 3x3, and the one-image 4x4.
                 # Pass the real grid_n: a 4x4 with distinct tile URLs must be
                 # composed as 16 cells, not sliced to the first 9 as a 3x3.
-                download_dynamic_grid_img(img_urls, grid_n=grid_n)
+                download_dynamic_grid_img(img_urls, grid_n=grid_n, driver=driver)
                 answers = _answers_for_current(phrase, grid_n)
 
-                # A 4x4 answer of all 16 cells is virtually always VLM
-                # over-selection (a real "every square matches" challenge does
-                # not occur), so treat it as unusable and reload rather than
-                # click all 16 and guarantee a reject.
-                usable = len(answers) >= 1 and (grid_n < 4 or len(answers) < 16)
+                # Over-selection guard for the FIRST round too (mirrors the
+                # dynamic re-round guard at ~line 840 — they were asymmetric: a
+                # 3x3 first round had NO guard, so a runaway VLM read of [1..9]
+                # / [1,2,3,5,6,7,8,9] got clicked wholesale, guaranteeing a
+                # reject and burning a verify round). reCAPTCHA never serves a
+                # grid where (nearly) every cell matches, so near-full is
+                # virtually always over-selection: treat >= n*n-1 (8/9 on 3x3,
+                # 15-16/16 on 4x4) as unusable and reload for a fresh, answerable
+                # grid. A legitimately busy 5-7 cell round still passes.
+                n_cells = grid_n * grid_n
+                usable = 1 <= len(answers) < n_cells - 1
                 if usable:
                     captcha = "squares" if grid_n >= 4 else "dynamic"
                     break
@@ -812,6 +927,7 @@ def solve_recaptcha(driver, verbose):
             if captcha is None:
                 break
 
+            _dump_solve_diag(driver, captcha, answers, tag="initial")
             _click_cells(driver, answers)
 
             if captcha == "dynamic":
@@ -826,12 +942,44 @@ def solve_recaptcha(driver, verbose):
                     )
                     if not is_new:
                         break
-                    fresh_urls = get_all_captcha_img_urls(driver)
-                    download_dynamic_grid_img(fresh_urls, grid_n=grid_n)
+                    shot = _use_screenshot_compose()
+                    if shot:
+                        # Screenshot path: shared composite URLs still render as
+                        # distinct tiles, so the distinct gate is meaningless.
+                        # Let the fade-in settle briefly, then snapshot below.
+                        sleep(0.6)
+                        fresh_urls = get_all_captcha_img_urls(driver)
+                    else:
+                        fresh_urls = _wait_for_settled_dynamic_grid(driver, grid_n)
+                    n_distinct = len(set(fresh_urls[:grid_n * grid_n]))
+                    if verbose:
+                        print(
+                            f"dynamic re-round: {len(fresh_urls)} img urls "
+                            f"(expect {grid_n * grid_n}); distinct={n_distinct} "
+                            f"mode={'shot' if shot else 'url'}"
+                        )
+                    # Legacy URL-compose only: a grid that never settles
+                    # (duplicate placeholder tiles mid-fade) would repeat a tile
+                    # and the VLM would over-select every copy (measured:
+                    # distinct=4 -> 7-of-9). Don't trust this round — verify with
+                    # the prior answers. The screenshot path renders correctly
+                    # even at distinct < n*n, so it skips this bail and keeps
+                    # re-rounding the real grid.
+                    if not shot and n_distinct < grid_n * grid_n:
+                        break
+                    download_dynamic_grid_img(fresh_urls, grid_n=grid_n, driver=driver)
                     img_urls = fresh_urls
                     answers = _answers_for_current(phrase, grid_n)
-                    if not answers:
+                    # Over-selection guard for fade-in re-rounds. Selecting
+                    # almost the entire grid in one re-round is the runaway
+                    # over-selection seen live (a 3x3 round returning 8 of 9
+                    # cells, then 4 — wildly unstable) and guarantees a reject.
+                    # Use a conservative bound (>= n*n-1, i.e. 8/9 or 15/16) so a
+                    # legitimately busy round of 5-7 matches still gets clicked;
+                    # only the near-full pathology stops the re-round loop.
+                    if not answers or len(answers) >= grid_n * grid_n - 1:
                         break
+                    _dump_solve_diag(driver, captcha, answers, tag="dynamic")
                     _click_cells(driver, answers)
 
             verify = WebDriverWait(driver, 10).until(

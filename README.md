@@ -93,6 +93,9 @@ DISPLAY=:0 python3 examples/solve_demo_page.py 10
 | `RECAPTCHA_VLM_MODEL`     | `gemini-2.5-flash`               | VLM model id (`gemini-2.5-flash-lite` is ~0.5 s faster)              |
 | `RECAPTCHA_VLM_TIMEOUT`   | `30`                             | per-call VLM timeout (seconds)                                       |
 | `RECAPTCHA_VLM_RETRIES`   | `2`                              | VLM retries before falling back to local YOLO                        |
+| `RECAPTCHA_VLM_SAMPLES`   | `1`                              | self-consistency: N parallel VLM passes then vote (`1` = single pass). `5` lifts 3×3 grid-exact **53→73 %** |
+| `RECAPTCHA_VLM_VOTE_RATIO`| `1.0`                            | fraction of passes that must agree when `SAMPLES>1` (`1.0` = unanimous, measured best; lower = more recall, more false positives) |
+| `RECAPTCHA_VLM_TEMPERATURE`| `0`                             | VLM sampling temperature; auto-bumps to `0.5` when `SAMPLES>1` so votes differ |
 | `RECAPTCHA_MAX_RELOADS`   | `12`                             | reload budget before giving up (bounds reCAPTCHA's suspicion)        |
 | `RECAPTCHA_SOLVER_DEADLINE_SEC` | `120`                      | hard wall-clock cap on one `solve_recaptcha` call                    |
 | `RECAPTCHA_YOLO_MODEL`    | `models/recaptcha_classifier.pt` | local-fallback classifier weights                                    |
