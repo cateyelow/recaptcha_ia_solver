@@ -26,3 +26,6 @@ venv/
 .claude/
 .idea/
 .vscode/
+
+# --- 검증 산출물/툴 출력 (자동 추가) ---
+/models/
